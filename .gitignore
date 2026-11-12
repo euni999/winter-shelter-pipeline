@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# API 샘플 응답 등 로컬 데이터 (용량이 크고 재생성 가능해서 커밋하지 않음)
+data/
