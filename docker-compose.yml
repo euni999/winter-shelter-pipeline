@@ -30,6 +30,13 @@ x-airflow-common: &airflow-common
     # 새 DAG는 일시정지 상태로 등록 → 내가 확인하고 켜기 전엔 API를 호출하지 않는다.
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # ── DAG가 쓸 값 (.env에서 이 두 개만 골라 넘김) ──
+    # AIRFLOW_VAR_<이름> → DAG에서 Variable.get("<이름>")으로 읽힌다.
+    # 환경변수 방식이라 Airflow DB나 웹 UI에 키가 저장·표시되지 않는다.
+    AIRFLOW_VAR_KMA_API_KEY: ${KMA_API_KEY:?}
+    # AIRFLOW_CONN_<ID> → conn_id "shelter_db"로 우리 적재용 db에 접속.
+    # 호스트 이름 db = 위 db 서비스 (같은 compose 네트워크라 이름으로 찾아간다).
+    AIRFLOW_CONN_SHELTER_DB: postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:?}
   volumes:
     # 내 PC 폴더를 컨테이너에 연결: dags/에 파일을 넣으면 Airflow가 바로 읽고,
     # 실행 로그는 logs/에 남아 PC에서 볼 수 있다. (없으면 Docker가 빈 폴더를 만든다)
