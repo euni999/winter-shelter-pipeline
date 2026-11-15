@@ -94,7 +94,8 @@ def kma_warning_list():
                 cur.execute("SELECT count(*) FROM kma_warning_list")
                 total = cur.fetchone()[0]
         finally:
-            conn.close()  # psycopg2의 with conn은 커밋만 하고 연결은 안 닫아서 직접 닫는다.
+            # 드라이버에 따라 with conn이 연결을 닫기도(psycopg 3) 안 닫기도(psycopg2) 해서 항상 직접 닫는다.
+            conn.close()
         print("받은 %d건 처리, 테이블 전체 %d건" % (len(rows), total))
 
     load(fetch())
