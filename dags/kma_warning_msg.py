@@ -6,6 +6,8 @@ API에서 다시 받을 수 없다. 원문을 남겨 두면 파서를 고친 뒤
 
 테이블: kma_warning_msg_raw(원문) → kma_warning_item(특보 N개) → kma_warning_area(구역 M개)
         kma_warning_msg_parse(통보문별 파싱 성공/실패 기록)
+        kma_warning_pub(Kafka로 보낸 이벤트 기록)
+마지막 publish 태스크가 새 한파특보를 "특보 × 시군구 + 쉼터 요약" 이벤트로 Kafka에 보낸다.
 """
 import json
 import re
@@ -162,6 +164,59 @@ def parse_msg(t2, t3):
     return items
 
 
+# ── Kafka 발행 ──────────────────────────────────────────────
+KAFKA = "kafka:9092"  # compose 네트워크 안 주소 (비밀이 아니라 상수로 둔다)
+TOPIC = "kma.warning.sgg"
+# 쉼터 요약이 의미 있는 건 한파뿐이라 한파만 보낸다. 다른 특보도 보내려면 여기에 추가.
+PUB_TYPES = ("한파",)
+
+# 보낸 이벤트 기록 → 다음 실행에서 안 보낸 것만 고른다.
+# 특보 테이블에 외래키를 걸지 않은 이유: 재파싱 때 특보 행을 지웠다 다시 넣으므로 FK가 있으면 막힌다.
+PUB_DDL = """
+CREATE TABLE IF NOT EXISTS kma_warning_pub (
+    stn_id       TEXT        NOT NULL,
+    tm_fc        TEXT        NOT NULL,
+    tm_seq       INTEGER     NOT NULL,
+    item_no      INTEGER     NOT NULL,
+    sido         TEXT        NOT NULL,
+    sgg          TEXT        NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stn_id, tm_fc, tm_seq, item_no, sido, sgg)
+);
+"""
+# 특보 → 구역 → 매핑표 → 시군구, 그리고 그 시군구의 쉼터 수·수용인원.
+# DISTINCT를 먼저 하는 이유: 강릉산지·강릉평지처럼 구역 둘이 같은 시군구로 가면
+# 쉼터를 두 번 붙여 합계가 두 배가 된다.
+EVENT_SQL = """
+WITH t AS (
+    SELECT DISTINCT i.stn_id, i.tm_fc, i.tm_seq, i.item_no, i.warn_type, i.warn_level,
+           i.action, i.effective_at, m.sido, m.sgg
+    FROM kma_warning_item i
+    JOIN kma_warning_area a USING (stn_id, tm_fc, tm_seq, item_no)
+    JOIN warning_area_sgg m ON m.parent = coalesce(a.parent, '') AND m.area = a.area
+    WHERE i.warn_type = ANY(%s)
+)
+SELECT t.*, count(s.fclt_no), coalesce(sum(s.capacity), 0)
+FROM t LEFT JOIN shelter s USING (sido, sgg)
+WHERE NOT EXISTS (SELECT 1 FROM kma_warning_pub p
+                  WHERE (p.stn_id, p.tm_fc, p.tm_seq, p.item_no, p.sido, p.sgg)
+                      = (t.stn_id, t.tm_fc, t.tm_seq, t.item_no, t.sido, t.sgg))
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+ORDER BY t.tm_fc, t.item_no
+"""
+
+
+def ensure_topic():
+    # 브로커에서 토픽 자동 생성을 꺼 뒀으므로(compose) 여기서 없을 때만 만든다.
+    # 파티션 3개: 시군구 키로 나뉘어 컨슈머를 늘리면 나눠 받을 수 있다. 브로커 1대라 복제는 1.
+    from confluent_kafka.admin import AdminClient, NewTopic
+
+    admin = AdminClient({"bootstrap.servers": KAFKA})
+    if TOPIC not in admin.list_topics(timeout=10).topics:
+        admin.create_topics([NewTopic(TOPIC, num_partitions=3, replication_factor=1)])[TOPIC].result()
+        print("토픽 생성:", TOPIC)
+
+
 def window():
     # 목록 DAG와 같은 이유로 "지금" 기준 최근 6일 (API가 허용하는 최대 범위).
     # 조회 가능한 첫날의 00시 발표분은 응답에서 빠지지만, 그 전 실행들에서 이미 받아진다(11/15 점검).
@@ -283,7 +338,58 @@ def kma_warning_msg():
             conn.close()
         print("파싱 대상 %d건: 성공 %d, 실패 %d" % (ok + failed, ok, failed))
 
-    load(fetch(stations())) >> parse()
+    @task
+    def publish():
+        # 태스크 안에서 import: DAG 파일은 수시로 다시 읽히는데, 그때마다 Kafka 라이브러리를
+        # 불러올 필요는 없다(Airflow 권장 방식).
+        from confluent_kafka import Producer
+
+        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(PUB_DDL)
+                cur.execute(EVENT_SQL, (list(PUB_TYPES),))
+                rows = cur.fetchall()
+            conn.commit()
+            if not rows:
+                print("새로 보낼 이벤트 없음")
+                return
+
+            ensure_topic()
+            # acks=all + 멱등 프로듀서: 브로커가 확실히 저장했을 때만 성공으로 보고,
+            # 네트워크 재시도로 같은 메시지가 두 번 쌓이는 것도 막는다.
+            producer = Producer({"bootstrap.servers": KAFKA, "acks": "all", "enable.idempotence": True})
+            errors = []
+            for stn, tm_fc, seq, n, wtype, level, action, at, sido, sgg, shelters, cap in rows:
+                event = {
+                    # 컨슈머가 중복을 거르는 기준 (아래 "최소 한 번" 설명 참고)
+                    "event_id": "%s-%s-%s-%s-%s-%s" % (stn, tm_fc, seq, n, sido, sgg),
+                    "warn_type": wtype, "warn_level": level, "action": action,
+                    # DB 드라이버는 UTC로 돌려주므로 한국 시각으로 바꿔 보낸다(같은 시각, 읽기 쉽게).
+                    "effective_at": at.astimezone(KST).isoformat() if at else None, "tm_fc": tm_fc,
+                    "sido": sido, "sgg": sgg, "shelters": shelters, "capacity": int(cap),
+                }
+                # 키 = 시군구: 같은 키는 같은 파티션 → 한 시군구 안에서는 발표→해제 순서가 지켜진다.
+                producer.produce(TOPIC, key=("%s %s" % (sido, sgg)).encode(),
+                                 value=json.dumps(event, ensure_ascii=False).encode(),
+                                 on_delivery=lambda err, msg: err and errors.append(str(err)))
+            left = producer.flush(30)  # 버퍼에 쌓인 것을 다 보내고 확인 응답까지 기다린다
+            if errors or left:
+                # 하나라도 실패하면 기록하지 않는다 → 다음 실행에서 전부 다시 보낸다.
+                raise RuntimeError("Kafka 전송 실패 %d건, 미전송 %d건: %s" % (len(errors), left, errors[:3]))
+
+            # 최소 한 번(at-least-once): 전송 성공 후 여기서 DB 기록이 실패하면 다음 실행에서 또 보낸다.
+            # 그래서 중복은 생길 수 있지만 누락은 없다. 중복은 event_id로 컨슈머가 거른다.
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO kma_warning_pub (stn_id, tm_fc, tm_seq, item_no, sido, sgg) "
+                                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                                [(r[0], r[1], r[2], r[3], r[8], r[9]) for r in rows])
+            conn.commit()
+        finally:
+            conn.close()
+        print("이벤트 %d건 발행 → %s" % (len(rows), TOPIC))
+
+    load(fetch(stations())) >> parse() >> publish()
 
 
 kma_warning_msg()

@@ -8,7 +8,10 @@ x-airflow-common: &airflow-common
   # 3.3.2 고정 이유: 3.4.0은 2026-11-06에 나온 지 일주일 된 .0 버전이라 초기 버그 위험이 있고,
   # 3.3.2는 3.3 계열 마지막 패치(2026-09-17)로 두 달간 쓰이며 안정화됐다.
   # Python도 태그에 명시: 안 쓰면 이미지 기본값이 바뀔 때 조용히 달라질 수 있다.
-  image: apache/airflow:3.3.2-python3.12
+  # 공식 이미지에 Kafka 클라이언트를 얹어 직접 빌드한다(airflow/Dockerfile).
+  # build 폴더를 airflow/로 좁힌 이유: 프로젝트 루트를 쓰면 data/ 등 전체가 빌드에 복사된다.
+  build: ./airflow
+  image: winter-shelter-airflow:3.3.2
   # env_file로 .env 전체를 넘기지 않고 필요한 값만 골라 넘긴다.
   # → API 키 등 Airflow에 필요 없는 비밀이 컨테이너에 들어가지 않는다.
   # ${VAR:?메시지}: .env에 값이 없으면 시작 자체를 막아 빈 비밀번호로 뜨는 사고를 방지.
@@ -146,7 +149,46 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # 특보 이벤트를 주고받는 메시지 브로커. Airflow(publish 태스크)가 보내고 컨슈머가 받는다.
+  # 단일 노드라 broker와 controller 역할을 한 컨테이너가 같이 맡는다(KRaft: ZooKeeper 불필요).
+  kafka:
+    # 4.3.2 고정 이유: 4.4.0(2026-10-22)은 나온 지 한 달이 안 된 .0 버전이라 피하고,
+    # 4.3 계열의 안정화 패치(2026-10-20)를 쓴다. Airflow 버전을 고른 기준과 같다.
+    image: apache/kafka:4.3.2
+    environment:
+      # 이 이미지는 환경변수를 하나라도 주면 기본 설정을 안 쓰므로 필요한 값을 모두 적는다.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # 9092: 클라이언트(Airflow·컨슈머)용, 9093: 컨트롤러 내부 통신용
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # 클라이언트에게 "나는 kafka:9092로 찾아오라"고 알려 주는 주소 (compose 네트워크 안 이름)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # 브로커가 1대라 내부 토픽 복제본도 1개일 수밖에 없다 (기본값 3이면 시작 못 함)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # 토픽 이름 오타로 엉뚱한 토픽이 생기지 않게, 토픽은 명시적으로만 만든다.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # JVM 기본 힙(1GB)은 Mac Docker 메모리에 부담 → 학습용 규모라 512MB로 줄인다.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    # ports를 열지 않음: Airflow와 컨슈머 모두 compose 네트워크 안에서 kafka:9092로 접근한다.
+    volumes:
+      # 메시지는 디스크에 저장된다 → 볼륨에 둬야 컨테이너를 다시 만들어도 남는다.
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
 # 위에서 쓴 이름 있는 볼륨을 여기서 선언해야 Docker가 만들어 관리한다.
 volumes:
   pgdata:
   airflow-pgdata:
+  kafkadata:
