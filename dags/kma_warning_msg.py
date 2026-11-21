@@ -41,7 +41,8 @@ ON CONFLICT (stn_id, tm_fc, tm_seq) DO NOTHING;
 
 
 # 파싱 로직을 고치면 이 숫자를 올린다 → 옛 버전으로 파싱된 원문만 다시 처리된다.
-PARSER_VERSION = 1
+# v2(11/21): 상태 '연장' 추가, 'o'로 시작하는 바다 부연 줄 무시
+PARSER_VERSION = 2
 
 # 외래키(REFERENCES): 원문에 없는 특보, 특보에 없는 구역이 생기지 않게 DB가 막아 준다.
 # 구역은 ON DELETE CASCADE: 특보 행을 지우면 딸린 구역도 같이 지워져, 다시 파싱할 때 지우기가 한 줄로 끝난다.
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS kma_warning_item (
     item_no      INTEGER NOT NULL,  -- t2·t3의 (1), (2) ...
     warn_type    TEXT    NOT NULL,  -- 한파 / 강풍 / 풍랑 ...
     warn_level   TEXT    NOT NULL,  -- 주의보 / 경보
-    action       TEXT    NOT NULL,  -- 발표 / 변경 / 해제
+    action       TEXT    NOT NULL,  -- 발표 / 변경 / 해제 / 연장
     effective_at TIMESTAMPTZ,       -- t3의 시각 (t5는 통보문당 하나라 특보별 시각으로 못 씀)
     area_text    TEXT    NOT NULL,  -- t2의 ':' 뒤 원문 (구역 파싱 검증용)
     PRIMARY KEY (stn_id, tm_fc, tm_seq, item_no),
@@ -84,7 +85,8 @@ CREATE TABLE IF NOT EXISTS kma_warning_msg_parse (
 """
 
 # "(3) 한파주의보 발표 : 경기도(가평, ...)" → 번호, 종류, 등급, 상태, 구역 문장
-ITEM_RE = re.compile(r"^\((\d+)\)\s*(\S+?)(주의보|경보)\s+(발표|변경|해제)\s*:\s*(.+)$")
+# 상태는 원문 전체(11/21, 433건)에서 발표·해제·변경·연장 4종만 확인됨. 새 값이 오면 실패로 기록돼 드러난다.
+ITEM_RE = re.compile(r"^\((\d+)\)\s*(\S+?)(주의보|경보)\s+(발표|변경|해제|연장)\s*:\s*(.+)$")
 # "(3) 한파주의보 발표 : 2026년 11월 06일 21시 00분" → 번호와 시각
 TIME_RE = re.compile(r"^\((\d+)\).*:\s*(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일\s*(\d{1,2})시\s*(\d{1,2})분")
 
@@ -96,6 +98,10 @@ def numbered_lines(text):
         line = line.strip()
         if re.match(r"^\(\d+\)", line):
             lines.append(line)
+        elif line.startswith("o "):
+            # 'o 충남북부앞바다(... 평수구역 제외)' 같은 바다 구역 부연 줄. 구역 목록이 아니라
+            # 이어 붙이면 구역 이름이 깨진다 → 버린다. (원문은 raw 테이블에 그대로 남아 있다)
+            continue
         elif line and lines:
             lines[-1] += " " + line
     return lines
