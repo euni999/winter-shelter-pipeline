@@ -46,3 +46,16 @@ Q=$(python3.9 -I scripts/map_area_sgg.py --query)
 docker compose exec -T db sh -c "$P -At -c \"$Q\"" \
   | python3.9 -I scripts/map_area_sgg.py --sql | docker compose exec -T db sh -c "$P -v ON_ERROR_STOP=1 -q"
 ```
+
+## 매일 점검
+
+특보 API는 6일치만 조회되므로, 실행이 5일 넘게 빠지면 데이터가 비게 된다.
+
+1. 웹 UI(localhost:8080)에서 전날 0시 실행이 success인지 확인
+2. 데이터 상태 확인 (모두 0이어야 정상)
+
+```bash
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "select count(*) as 미매핑_구역 from warning_area_unmapped" \
+  -c "select count(*) as 파싱_실패 from kma_warning_msg_parse where error is not null"'
+```
