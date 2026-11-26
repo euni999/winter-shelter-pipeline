@@ -10,25 +10,7 @@ from airflow.sdk import Variable, dag, task
 
 URL = "https://apis.data.go.kr/1360000/WthrWrnInfoService/getWthrWrnList"
 KST = pendulum.timezone("Asia/Seoul")
-
-# (stn_id, tm_fc, tm_seq)를 기본키로 둬서 같은 특보가 다시 들어오면 DB가 거부하게 한다.
-# tm_seq(제11-34호의 34)는 관서별·월별로 다시 시작해 단독으로는 겹칠 수 있어 세 개를 묶었다.
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS kma_warning_list (
-    stn_id     TEXT        NOT NULL,  -- 발표 관서 코드 (구역 아님)
-    tm_fc      TEXT        NOT NULL,  -- 발표시각 YYYYMMDDHHMI
-    tm_seq     INTEGER     NOT NULL,  -- 발표 번호
-    title      TEXT        NOT NULL,  -- 종류·등급·발표/해제가 들어 있는 원문 (파싱은 나중에)
-    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 처음 받은 시각 (언제 수집됐는지 추적용)
-    PRIMARY KEY (stn_id, tm_fc, tm_seq)
-);
-"""
-# ON CONFLICT DO NOTHING: 이미 있는 행은 조용히 건너뛴다 → 몇 번을 다시 돌려도 결과가 같다(멱등).
-INSERT_SQL = """
-INSERT INTO kma_warning_list (stn_id, tm_fc, tm_seq, title)
-VALUES (%s, %s, %s, %s)
-ON CONFLICT (stn_id, tm_fc, tm_seq) DO NOTHING;
-"""
+# 테이블 구조는 dags/tables.py(SQLAlchemy Core)에 정의돼 있다.
 
 
 @dag(
@@ -75,7 +57,9 @@ def kma_warning_list():
             body = data["response"]["body"]
             items = body["items"]["item"]
             items = [items] if isinstance(items, dict) else items  # 1건이면 dict로 온다
-            rows += [(str(i["stnId"]), str(i["tmFc"]), int(i["tmSeq"]), i["title"]) for i in items]
+            # 컬럼 이름을 키로 둔 dict: SQLAlchemy insert에 그대로 넘긴다(순서 실수가 없다).
+            rows += [{"stn_id": str(i["stnId"]), "tm_fc": str(i["tmFc"]), "tm_seq": int(i["tmSeq"]),
+                      "title": i["title"]} for i in items]
             if len(rows) >= int(body["totalCount"]):
                 break
         print("받은 특보 %d건 (%s~%s)" % (len(rows), params["fromTmFc"], params["toTmFc"]))
@@ -84,18 +68,20 @@ def kma_warning_list():
 
     @task
     def load(rows):
-        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
-        try:
-            # with conn: 블록이 끝나면 커밋, 중간에 실패하면 전체 취소(롤백)
-            # → 반쯤만 들어간 상태가 남지 않는다.
-            with conn, conn.cursor() as cur:
-                cur.execute(CREATE_SQL)  # 첫 실행에만 실제로 만들고, 이후엔 아무 일도 안 한다.
-                cur.executemany(INSERT_SQL, rows)
-                cur.execute("SELECT count(*) FROM kma_warning_list")
-                total = cur.fetchone()[0]
-        finally:
-            # 드라이버에 따라 with conn이 연결을 닫기도(psycopg 3) 안 닫기도(psycopg2) 해서 항상 직접 닫는다.
-            conn.close()
+        # 태스크 안에서 import: tables.py는 dags/ 폴더에 있어 DAG 파일을 읽을 때마다 불러올 필요가 없다.
+        from sqlalchemy import func, select
+        from sqlalchemy.dialects.postgresql import insert
+        from tables import kma_warning_list as t
+
+        engine = PostgresHook(postgres_conn_id="shelter_db").get_sqlalchemy_engine()
+        # engine.begin(): 블록이 끝나면 커밋, 실패하면 롤백하고 연결도 반납한다.
+        # → 예전처럼 드라이버(psycopg 2/3)마다 다른 `with conn` 동작을 신경 쓸 필요가 없다.
+        with engine.begin() as conn:
+            t.create(conn, checkfirst=True)  # CREATE TABLE IF NOT EXISTS와 같다
+            if rows:  # 빈 목록을 넘기면 값 없는 INSERT 한 번으로 바뀌어 NOT NULL 오류가 난다
+                # 이미 있는 특보(기본키 충돌)는 건너뛴다 → 몇 번을 다시 돌려도 결과가 같다(멱등).
+                conn.execute(insert(t).on_conflict_do_nothing(index_elements=t.primary_key.columns), rows)
+            total = conn.scalar(select(func.count()).select_from(t))
         print("받은 %d건 처리, 테이블 전체 %d건" % (len(rows), total))
 
     load(fetch())
