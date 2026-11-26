@@ -187,6 +187,23 @@ services:
       start_period: 30s
     restart: always
 
+  # 한파 이벤트를 받아 warning_event 테이블에 쌓는 컨슈머 (Python 3.11, consumer/).
+  consumer:
+    build: ./consumer
+    image: winter-shelter-consumer:1
+    # .env 전체가 아니라 DB 접속에 필요한 세 값만 넘긴다(API 키는 필요 없다).
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db:
+        condition: service_started
+    # 오류로 죽으면 다시 띄운다. 오프셋은 DB 커밋 뒤에만 넘어가므로 다시 떠도 유실이 없다.
+    restart: always
+
 # 위에서 쓴 이름 있는 볼륨을 여기서 선언해야 Docker가 만들어 관리한다.
 volumes:
   pgdata:

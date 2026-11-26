@@ -5,7 +5,7 @@
 ## 흐름
 
 ```text
-기상청 특보 API ──(매일)──▶ Airflow ──▶ Postgres ──▶ Kafka (kma.warning.sgg)
+기상청 특보 API ──(매일)──▶ Airflow ──▶ Postgres ──▶ Kafka (kma.warning.sgg) ──▶ consumer ──▶ warning_event
 행안부 쉼터 API ──(매주)──▶ Airflow ──▶ Postgres ─┘   "한파특보 × 시군구 + 쉼터 요약" 이벤트
 ```
 
@@ -22,6 +22,7 @@
 | `airflow-scheduler` | 스케줄링·태스크 실행 (LocalExecutor) |
 | `airflow-dag-processor` | DAG 파일 읽기 |
 | `kafka` | 메시지 브로커 (KRaft 단일 노드) |
+| `consumer` | 한파 이벤트를 받아 `warning_event`에 기록 (Python 3.11, 중복은 event_id로 걸러냄) |
 
 ## DAG
 
