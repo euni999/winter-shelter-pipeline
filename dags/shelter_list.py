@@ -5,8 +5,6 @@
 왜 덮어쓰지 않고 upsert하나: first_seen_at/last_seen_at을 남겨 쉼터가 언제 생기고
 (목록에서) 사라졌는지 추적하려고. 사라진 쉼터는 지우지 않고 last_seen_at이 멈춘 채 남는다.
 """
-import json
-
 import pendulum
 import requests
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -15,33 +13,7 @@ from airflow.sdk import Variable, dag, task
 URL = "https://www.safetydata.go.kr/V2/api/DSSP-IF-10804"
 KST = pendulum.timezone("Asia/Seoul")
 ROWS = 1000  # 사전점검에서 1000이 최대로 확인됨
-
-# 자주 쓰는 값만 컬럼으로 꺼내고, 운영시간 등 나머지는 원문(item)에 그대로 둔다.
-# sido/sgg는 주소 앞 두 단어 → 특보구역 매핑표(warning_area_sgg)와 같은 이름 체계.
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS shelter (
-    fclt_no       BIGINT PRIMARY KEY,  -- REARE_FCLT_NO (사전점검에서 중복 0 확인)
-    name          TEXT,
-    fclt_type     TEXT,                -- 001 공공, 003 경로당, 004 민간
-    sido          TEXT,                -- 주소가 없으면 NULL (약 610건)
-    sgg           TEXT,
-    capacity      INTEGER,             -- 이용가능인원 UTZTN_PSBLTY_TNOP
-    lat           DOUBLE PRECISION,
-    lon           DOUBLE PRECISION,
-    item          JSONB NOT NULL,      -- API 원문 한 행
-    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 처음 목록에 나온 시각 (갱신 안 함)
-    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()   -- 마지막으로 목록에 있던 시각
-);
-"""
-# 이미 있는 쉼터는 내용을 최신으로 바꾸고 last_seen_at만 당긴다. first_seen_at은 그대로.
-UPSERT_SQL = """
-INSERT INTO shelter (fclt_no, name, fclt_type, sido, sgg, capacity, lat, lon, item)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-ON CONFLICT (fclt_no) DO UPDATE SET
-    name = EXCLUDED.name, fclt_type = EXCLUDED.fclt_type, sido = EXCLUDED.sido,
-    sgg = EXCLUDED.sgg, capacity = EXCLUDED.capacity, lat = EXCLUDED.lat, lon = EXCLUDED.lon,
-    item = EXCLUDED.item, last_seen_at = now();
-"""
+# 테이블 구조는 dags/tables.py(SQLAlchemy Core)의 shelter에 정의돼 있다.
 
 
 def sido_sgg(r):
@@ -87,29 +59,36 @@ def shelter_list():
         if len(rows) < total:
             raise RuntimeError("쉼터 %d/%d건만 받음" % (len(rows), total))
 
+        from sqlalchemy import func, select
+        from sqlalchemy.dialects.postgresql import insert
+        from tables import shelter as t
+
         params = []
         for r in rows:
             sido, sgg = sido_sgg(r)
-            params.append((r["REARE_FCLT_NO"], r.get("REARE_NM"), r.get("FCLT_TYPE"), sido, sgg,
-                           r.get("UTZTN_PSBLTY_TNOP"), r.get("LAT"), r.get("LOT"),
-                           json.dumps(r, ensure_ascii=False)))
+            # item은 dict 그대로: JSONB 컬럼이라 SQLAlchemy가 JSON으로 바꿔 넣는다.
+            params.append({"fclt_no": r["REARE_FCLT_NO"], "name": r.get("REARE_NM"),
+                           "fclt_type": r.get("FCLT_TYPE"), "sido": sido, "sgg": sgg,
+                           "capacity": r.get("UTZTN_PSBLTY_TNOP"), "lat": r.get("LAT"),
+                           "lon": r.get("LOT"), "item": r})
 
-        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
-        try:
-            # 전부 성공하면 커밋, 하나라도 실패하면 전체 롤백 → 반쯤 갱신된 상태가 남지 않는다.
-            # with conn 대신 직접 커밋: psycopg 3에선 with conn이 연결까지 닫아 버려서(통보문 DAG에서 겪음).
-            with conn.cursor() as cur:
-                cur.execute(CREATE_SQL)
-                cur.executemany(UPSERT_SQL, params)
-                cur.execute("SELECT count(*), count(*) FILTER (WHERE last_seen_at < now()) FROM shelter")
-                n_all, n_gone = cur.fetchone()
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-        # now()는 트랜잭션 시작 시각이라, 이번에 안 들어온 쉼터만 last_seen_at < now()가 된다.
+        stmt = insert(t)
+        # 이미 있는 쉼터는 내용을 최신으로 바꾸고 last_seen_at만 당긴다. first_seen_at은 그대로.
+        # stmt.excluded = 이번에 넣으려던 값 (SQL의 EXCLUDED)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[t.c.fclt_no],
+            set_={**{c: stmt.excluded[c] for c in ("name", "fclt_type", "sido", "sgg",
+                                                   "capacity", "lat", "lon", "item")},
+                  "last_seen_at": func.now()})
+
+        engine = PostgresHook(postgres_conn_id="shelter_db").get_sqlalchemy_engine()
+        # 전부 성공하면 커밋, 하나라도 실패하면 전체 롤백 → 반쯤 갱신된 상태가 남지 않는다.
+        with engine.begin() as conn:
+            t.create(conn, checkfirst=True)
+            conn.execute(stmt, params)
+            # now()는 트랜잭션 시작 시각이라, 이번에 안 들어온 쉼터만 last_seen_at < now()가 된다.
+            n_all, n_gone = conn.execute(select(
+                func.count(), func.count().filter(t.c.last_seen_at < func.now())).select_from(t)).one()
         print("받은 %d건 upsert, 테이블 전체 %d건, 이번 목록에 없던 쉼터 %d건" % (len(params), n_all, n_gone))
 
     fetch_and_load()

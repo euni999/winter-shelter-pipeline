@@ -20,69 +20,18 @@ from airflow.sdk import Variable, dag, task
 BASE = "https://apis.data.go.kr/1360000/WthrWrnInfoService/"
 KST = pendulum.timezone("Asia/Seoul")
 
-# 항목 전체를 jsonb로 저장: 지금 안 쓰는 필드(t4 해제 예고, t6 현재 특보 현황 등)도 나중에 쓸 수 있게.
-# 기본키는 목록 테이블과 같은 (관서, 발표시각, 발표번호) → 두 테이블을 이 키로 맞춰 볼 수 있다.
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS kma_warning_msg_raw (
-    stn_id     TEXT        NOT NULL,  -- 발표 관서 코드
-    tm_fc      TEXT        NOT NULL,  -- 발표시각 YYYYMMDDHHMI
-    tm_seq     INTEGER     NOT NULL,  -- 발표 번호
-    item       JSONB       NOT NULL,  -- API 응답 항목 원문 (t1 제목, t2 구역, t3·t5 발효·해제 시각 ...)
-    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (stn_id, tm_fc, tm_seq)
-);
-"""
-# 목록 DAG와 같은 방식의 멱등 적재: 이미 있는 통보문은 건너뛴다.
-INSERT_SQL = """
-INSERT INTO kma_warning_msg_raw (stn_id, tm_fc, tm_seq, item)
-VALUES (%s, %s, %s, %s::jsonb)
-ON CONFLICT (stn_id, tm_fc, tm_seq) DO NOTHING;
-"""
+# 테이블 구조는 dags/tables.py(SQLAlchemy Core)에 정의돼 있다.
+
+
+def engine():
+    # 연결은 SQLAlchemy 엔진으로: begin() 블록이 커밋·롤백·연결 반납을 알아서 한다.
+    # (예전처럼 드라이버마다 다른 `with conn` 동작을 신경 쓸 필요가 없다)
+    return PostgresHook(postgres_conn_id="shelter_db").get_sqlalchemy_engine()
 
 
 # 파싱 로직을 고치면 이 숫자를 올린다 → 옛 버전으로 파싱된 원문만 다시 처리된다.
 # v2(11/21): 상태 '연장' 추가, 'o'로 시작하는 바다 부연 줄 무시
 PARSER_VERSION = 2
-
-# 외래키(REFERENCES): 원문에 없는 특보, 특보에 없는 구역이 생기지 않게 DB가 막아 준다.
-# 구역은 ON DELETE CASCADE: 특보 행을 지우면 딸린 구역도 같이 지워져, 다시 파싱할 때 지우기가 한 줄로 끝난다.
-PARSE_DDL = """
-CREATE TABLE IF NOT EXISTS kma_warning_item (
-    stn_id       TEXT    NOT NULL,
-    tm_fc        TEXT    NOT NULL,
-    tm_seq       INTEGER NOT NULL,
-    item_no      INTEGER NOT NULL,  -- t2·t3의 (1), (2) ...
-    warn_type    TEXT    NOT NULL,  -- 한파 / 강풍 / 풍랑 ...
-    warn_level   TEXT    NOT NULL,  -- 주의보 / 경보
-    action       TEXT    NOT NULL,  -- 발표 / 변경 / 해제 / 연장
-    effective_at TIMESTAMPTZ,       -- t3의 시각 (t5는 통보문당 하나라 특보별 시각으로 못 씀)
-    area_text    TEXT    NOT NULL,  -- t2의 ':' 뒤 원문 (구역 파싱 검증용)
-    PRIMARY KEY (stn_id, tm_fc, tm_seq, item_no),
-    FOREIGN KEY (stn_id, tm_fc, tm_seq) REFERENCES kma_warning_msg_raw
-);
-CREATE TABLE IF NOT EXISTS kma_warning_area (
-    stn_id  TEXT    NOT NULL,
-    tm_fc   TEXT    NOT NULL,
-    tm_seq  INTEGER NOT NULL,
-    item_no INTEGER NOT NULL,
-    area_no INTEGER NOT NULL,  -- 문장 안 순서
-    parent  TEXT,              -- 경기도 / 동해남부앞바다 / NULL(울릉도.독도처럼 단독)
-    area    TEXT    NOT NULL,  -- 가평 / 경북북부앞바다 / 울릉도.독도
-    note    TEXT,              -- '여서도 제외' 같은 괄호 부연
-    PRIMARY KEY (stn_id, tm_fc, tm_seq, item_no, area_no),
-    FOREIGN KEY (stn_id, tm_fc, tm_seq, item_no) REFERENCES kma_warning_item ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS kma_warning_msg_parse (
-    stn_id         TEXT        NOT NULL,
-    tm_fc          TEXT        NOT NULL,
-    tm_seq         INTEGER     NOT NULL,
-    parser_version INTEGER     NOT NULL,
-    parsed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    error          TEXT,       -- 실패 사유 (성공이면 NULL). 실패해도 원문은 지우지 않는다.
-    PRIMARY KEY (stn_id, tm_fc, tm_seq),
-    FOREIGN KEY (stn_id, tm_fc, tm_seq) REFERENCES kma_warning_msg_raw
-);
-"""
 
 # "(3) 한파주의보 발표 : 경기도(가평, ...)" → 번호, 종류, 등급, 상태, 구역 문장
 # 상태는 원문 전체(11/21, 433건)에서 발표·해제·변경·연장 4종만 확인됨. 새 값이 오면 실패로 기록돼 드러난다.
@@ -176,20 +125,6 @@ TOPIC = "kma.warning.sgg"
 # 쉼터 요약이 의미 있는 건 한파뿐이라 한파만 보낸다. 다른 특보도 보내려면 여기에 추가.
 PUB_TYPES = ("한파",)
 
-# 보낸 이벤트 기록 → 다음 실행에서 안 보낸 것만 고른다.
-# 특보 테이블에 외래키를 걸지 않은 이유: 재파싱 때 특보 행을 지웠다 다시 넣으므로 FK가 있으면 막힌다.
-PUB_DDL = """
-CREATE TABLE IF NOT EXISTS kma_warning_pub (
-    stn_id       TEXT        NOT NULL,
-    tm_fc        TEXT        NOT NULL,
-    tm_seq       INTEGER     NOT NULL,
-    item_no      INTEGER     NOT NULL,
-    sido         TEXT        NOT NULL,
-    sgg          TEXT        NOT NULL,
-    published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (stn_id, tm_fc, tm_seq, item_no, sido, sgg)
-);
-"""
 # 특보 → 구역 → 매핑표 → 시군구, 그리고 그 시군구의 쉼터 수·수용인원.
 # DISTINCT를 먼저 하는 이유: 강릉산지·강릉평지처럼 구역 둘이 같은 시군구로 가면
 # 쉼터를 두 번 붙여 합계가 두 배가 된다.
@@ -200,7 +135,7 @@ WITH t AS (
     FROM kma_warning_item i
     JOIN kma_warning_area a USING (stn_id, tm_fc, tm_seq, item_no)
     JOIN warning_area_sgg m ON m.parent = coalesce(a.parent, '') AND m.area = a.area
-    WHERE i.warn_type = ANY(%s)
+    WHERE i.warn_type = ANY(:types)
 )
 SELECT t.*, count(s.fclt_no), coalesce(sum(s.capacity), 0)
 FROM t LEFT JOIN shelter s USING (sido, sgg)
@@ -278,70 +213,81 @@ def kma_warning_msg():
         rows = []
         for stn in stn_ids:
             items = get_items("getWthrWrnMsg", stnId=stn)
-            rows += [(str(i["stnId"]), str(i["tmFc"]), int(i["tmSeq"]), json.dumps(i, ensure_ascii=False))
+            # item은 dict 그대로: JSONB 컬럼이라 SQLAlchemy가 JSON으로 바꿔 넣는다.
+            rows += [{"stn_id": str(i["stnId"]), "tm_fc": str(i["tmFc"]), "tm_seq": int(i["tmSeq"]), "item": i}
                      for i in items]
             print("관서 %s: %d건" % (stn, len(items)))
         return rows
 
     @task
     def load(rows):
-        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
-        try:
-            with conn, conn.cursor() as cur:  # 블록 끝에서 커밋, 실패하면 전체 롤백
-                cur.execute(CREATE_SQL)
-                cur.executemany(INSERT_SQL, rows)
-                cur.execute("SELECT count(*) FROM kma_warning_msg_raw")
-                total = cur.fetchone()[0]
-        finally:
-            conn.close()
+        from sqlalchemy import func, select
+        from sqlalchemy.dialects.postgresql import insert
+        from tables import kma_warning_msg_raw as t
+
+        with engine().begin() as conn:  # 블록 끝에서 커밋, 실패하면 전체 롤백
+            t.create(conn, checkfirst=True)
+            if rows:  # 빈 목록이면 값 없는 INSERT가 돼 NOT NULL 오류가 난다
+                # 목록 DAG와 같은 멱등 적재: 이미 있는 통보문은 건너뛴다.
+                conn.execute(insert(t).on_conflict_do_nothing(index_elements=t.primary_key.columns), rows)
+            total = conn.scalar(select(func.count()).select_from(t))
         print("받은 %d건 처리, 테이블 전체 %d건" % (len(rows), total))
 
     @task
     def parse():
         # 오늘 받은 것만이 아니라 "아직 파싱 안 됐거나 옛 버전으로 파싱된" 원문 전체가 대상.
         # → 백업처럼 DAG 밖에서 넣은 원문도, 파서를 고친 뒤의 재처리도 같은 태스크가 맡는다.
-        # 연결 하나로 통보문 여러 건을 각각의 트랜잭션으로 처리하므로 commit/rollback을 직접 부른다.
-        # (이 이미지의 드라이버는 psycopg 3이라 `with conn:`을 쓰면 블록 끝에서 연결까지 닫혀 버린다)
-        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
+        from sqlalchemy import and_, delete, func, or_, select
+        from sqlalchemy.dialects.postgresql import insert
+        from tables import kma_warning_area as area_t
+        from tables import kma_warning_item as item_t
+        from tables import kma_warning_msg_parse as parse_t
+        from tables import kma_warning_msg_raw as raw_t
+        from tables import metadata
+
+        eng = engine()
+        with eng.begin() as conn:
+            metadata.create_all(conn, tables=[item_t, area_t, parse_t])  # 없을 때만 만든다
+            todo = conn.execute(
+                select(raw_t.c.stn_id, raw_t.c.tm_fc, raw_t.c.tm_seq,
+                       raw_t.c.item["t2"].astext, raw_t.c.item["t3"].astext)  # item->>'t2'
+                .outerjoin(parse_t, and_(*[raw_t.c[k] == parse_t.c[k] for k in ("stn_id", "tm_fc", "tm_seq")]))
+                .where(or_(parse_t.c.stn_id.is_(None), parse_t.c.parser_version < PARSER_VERSION))
+            ).all()
+
+        # 파싱 상태 기록: 처음이면 넣고, 다시 파싱한 거면 버전·시각·오류를 덮어쓴다.
+        status = insert(parse_t)
+        status = status.on_conflict_do_update(
+            index_elements=parse_t.primary_key.columns,
+            set_={"parser_version": status.excluded.parser_version, "parsed_at": func.now(),
+                  "error": status.excluded.error})
+
         ok = failed = 0
-        try:
-            with conn.cursor() as cur:
-                cur.execute(PARSE_DDL)
-                cur.execute("""
-                    SELECT r.stn_id, r.tm_fc, r.tm_seq, r.item->>'t2', r.item->>'t3'
-                    FROM kma_warning_msg_raw r
-                    LEFT JOIN kma_warning_msg_parse p USING (stn_id, tm_fc, tm_seq)
-                    WHERE p.stn_id IS NULL OR p.parser_version < %s""", (PARSER_VERSION,))
-                todo = cur.fetchall()
-            conn.commit()
+        with eng.connect() as conn:
             for stn, tm_fc, seq, t2, t3 in todo:
-                key = (stn, tm_fc, seq)
-                status = "INSERT INTO kma_warning_msg_parse (stn_id, tm_fc, tm_seq, parser_version, error) " \
-                         "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (stn_id, tm_fc, tm_seq) DO UPDATE " \
-                         "SET parser_version = EXCLUDED.parser_version, parsed_at = now(), error = EXCLUDED.error"
+                key = {"stn_id": stn, "tm_fc": tm_fc, "tm_seq": seq}
                 try:
                     items = parse_msg(t2, t3)
-                    # 통보문 하나 = 트랜잭션 하나: 기존 결과 삭제 → 새로 넣기 → 상태 기록이 함께 성공하거나 함께 취소된다.
-                    with conn.cursor() as cur:
-                        cur.execute("DELETE FROM kma_warning_item WHERE stn_id=%s AND tm_fc=%s AND tm_seq=%s", key)
+                    # 통보문 하나 = 트랜잭션 하나: 기존 결과 삭제 → 새로 넣기 → 상태 기록이 함께 성공하거나
+                    # 함께 취소된다. conn.begin() 블록 안에서 예외가 나면 SQLAlchemy가 자동으로 롤백한다.
+                    with conn.begin():
+                        conn.execute(delete(item_t).filter_by(**key))  # 딸린 구역은 CASCADE로 같이 삭제
                         for n, wtype, level, action, at, area_text, areas in items:
-                            cur.execute("INSERT INTO kma_warning_item VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                                        key + (n, wtype, level, action, at, area_text))
-                            cur.executemany("INSERT INTO kma_warning_area VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                                            [key + (n, i, p, a, note) for i, (p, a, note) in enumerate(areas, 1)])
-                        cur.execute(status, key + (PARSER_VERSION, None))
-                    conn.commit()
+                            conn.execute(insert(item_t), {**key, "item_no": n, "warn_type": wtype,
+                                                          "warn_level": level, "action": action,
+                                                          "effective_at": at, "area_text": area_text})
+                            if areas:
+                                conn.execute(insert(area_t), [{**key, "item_no": n, "area_no": i, "parent": p,
+                                                               "area": a, "note": note}
+                                                              for i, (p, a, note) in enumerate(areas, 1)])
+                        conn.execute(status, {**key, "parser_version": PARSER_VERSION, "error": None})
                     ok += 1
                 except Exception as e:
-                    # 실패한 통보문은 반쯤 들어간 결과를 취소하고, 원문은 그대로 둔 채 사유만 남긴다.
-                    # 다른 통보문 파싱은 계속한다.
-                    conn.rollback()
-                    with conn.cursor() as cur:
-                        cur.execute(status, key + (PARSER_VERSION, "%s: %s" % (type(e).__name__, str(e)[:300])))
-                    conn.commit()
+                    # 실패한 통보문은 (이미 롤백됐고) 원문은 그대로 둔 채 사유만 남긴다. 다른 통보문은 계속.
+                    with conn.begin():
+                        conn.execute(status, {**key, "parser_version": PARSER_VERSION,
+                                              "error": "%s: %s" % (type(e).__name__, str(e)[:300])})
                     failed += 1
-        finally:
-            conn.close()
         print("파싱 대상 %d건: 성공 %d, 실패 %d" % (ok + failed, ok, failed))
 
     @task
@@ -349,50 +295,48 @@ def kma_warning_msg():
         # 태스크 안에서 import: DAG 파일은 수시로 다시 읽히는데, 그때마다 Kafka 라이브러리를
         # 불러올 필요는 없다(Airflow 권장 방식).
         from confluent_kafka import Producer
+        from sqlalchemy import text
+        from sqlalchemy.dialects.postgresql import insert
+        from tables import kma_warning_pub as pub_t
 
-        conn = PostgresHook(postgres_conn_id="shelter_db").get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(PUB_DDL)
-                cur.execute(EVENT_SQL, (list(PUB_TYPES),))
-                rows = cur.fetchall()
-            conn.commit()
-            if not rows:
-                print("새로 보낼 이벤트 없음")
-                return
+        eng = engine()
+        with eng.begin() as conn:
+            pub_t.create(conn, checkfirst=True)
+            # 여러 테이블을 잇는 분석 쿼리는 Core로 옮기면 오히려 읽기 어려워 SQL 그대로 둔다(text).
+            rows = conn.execute(text(EVENT_SQL), {"types": list(PUB_TYPES)}).all()
+        if not rows:
+            print("새로 보낼 이벤트 없음")
+            return
 
-            ensure_topic()
-            # acks=all + 멱등 프로듀서: 브로커가 확실히 저장했을 때만 성공으로 보고,
-            # 네트워크 재시도로 같은 메시지가 두 번 쌓이는 것도 막는다.
-            producer = Producer({"bootstrap.servers": KAFKA, "acks": "all", "enable.idempotence": True})
-            errors = []
-            for stn, tm_fc, seq, n, wtype, level, action, at, sido, sgg, shelters, cap in rows:
-                event = {
-                    # 컨슈머가 중복을 거르는 기준 (아래 "최소 한 번" 설명 참고)
-                    "event_id": "%s-%s-%s-%s-%s-%s" % (stn, tm_fc, seq, n, sido, sgg),
-                    "warn_type": wtype, "warn_level": level, "action": action,
-                    # DB 드라이버는 UTC로 돌려주므로 한국 시각으로 바꿔 보낸다(같은 시각, 읽기 쉽게).
-                    "effective_at": at.astimezone(KST).isoformat() if at else None, "tm_fc": tm_fc,
-                    "sido": sido, "sgg": sgg, "shelters": shelters, "capacity": int(cap),
-                }
-                # 키 = 시군구: 같은 키는 같은 파티션 → 한 시군구 안에서는 발표→해제 순서가 지켜진다.
-                producer.produce(TOPIC, key=("%s %s" % (sido, sgg)).encode(),
-                                 value=json.dumps(event, ensure_ascii=False).encode(),
-                                 on_delivery=lambda err, msg: err and errors.append(str(err)))
-            left = producer.flush(30)  # 버퍼에 쌓인 것을 다 보내고 확인 응답까지 기다린다
-            if errors or left:
-                # 하나라도 실패하면 기록하지 않는다 → 다음 실행에서 전부 다시 보낸다.
-                raise RuntimeError("Kafka 전송 실패 %d건, 미전송 %d건: %s" % (len(errors), left, errors[:3]))
+        ensure_topic()
+        # acks=all + 멱등 프로듀서: 브로커가 확실히 저장했을 때만 성공으로 보고,
+        # 네트워크 재시도로 같은 메시지가 두 번 쌓이는 것도 막는다.
+        producer = Producer({"bootstrap.servers": KAFKA, "acks": "all", "enable.idempotence": True})
+        errors = []
+        for stn, tm_fc, seq, n, wtype, level, action, at, sido, sgg, shelters, cap in rows:
+            event = {
+                # 컨슈머가 중복을 거르는 기준 (아래 "최소 한 번" 설명 참고)
+                "event_id": "%s-%s-%s-%s-%s-%s" % (stn, tm_fc, seq, n, sido, sgg),
+                "warn_type": wtype, "warn_level": level, "action": action,
+                # DB 드라이버는 UTC로 돌려주므로 한국 시각으로 바꿔 보낸다(같은 시각, 읽기 쉽게).
+                "effective_at": at.astimezone(KST).isoformat() if at else None, "tm_fc": tm_fc,
+                "sido": sido, "sgg": sgg, "shelters": shelters, "capacity": int(cap),
+            }
+            # 키 = 시군구: 같은 키는 같은 파티션 → 한 시군구 안에서는 발표→해제 순서가 지켜진다.
+            producer.produce(TOPIC, key=("%s %s" % (sido, sgg)).encode(),
+                             value=json.dumps(event, ensure_ascii=False).encode(),
+                             on_delivery=lambda err, msg: err and errors.append(str(err)))
+        left = producer.flush(30)  # 버퍼에 쌓인 것을 다 보내고 확인 응답까지 기다린다
+        if errors or left:
+            # 하나라도 실패하면 기록하지 않는다 → 다음 실행에서 전부 다시 보낸다.
+            raise RuntimeError("Kafka 전송 실패 %d건, 미전송 %d건: %s" % (len(errors), left, errors[:3]))
 
-            # 최소 한 번(at-least-once): 전송 성공 후 여기서 DB 기록이 실패하면 다음 실행에서 또 보낸다.
-            # 그래서 중복은 생길 수 있지만 누락은 없다. 중복은 event_id로 컨슈머가 거른다.
-            with conn.cursor() as cur:
-                cur.executemany("INSERT INTO kma_warning_pub (stn_id, tm_fc, tm_seq, item_no, sido, sgg) "
-                                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                [(r[0], r[1], r[2], r[3], r[8], r[9]) for r in rows])
-            conn.commit()
-        finally:
-            conn.close()
+        # 최소 한 번(at-least-once): 전송 성공 후 여기서 DB 기록이 실패하면 다음 실행에서 또 보낸다.
+        # 그래서 중복은 생길 수 있지만 누락은 없다. 중복은 event_id로 컨슈머가 거른다.
+        with eng.begin() as conn:
+            conn.execute(insert(pub_t).on_conflict_do_nothing(),
+                         [{"stn_id": r[0], "tm_fc": r[1], "tm_seq": r[2], "item_no": r[3],
+                           "sido": r[8], "sgg": r[9]} for r in rows])
         print("이벤트 %d건 발행 → %s" % (len(rows), TOPIC))
 
     load(fetch(stations())) >> parse() >> publish()
