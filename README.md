@@ -60,3 +60,19 @@ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -c "select count(*) as 미매핑_구역 from warning_area_unmapped" \
   -c "select count(*) as 파싱_실패 from kma_warning_msg_parse where error is not null"'
 ```
+3. 컨슈머 확인: 밀린 메시지(LAG)가 모두 0이고, 보낸 이벤트 수와 받은 이벤트 수가 같아야 정상
+
+```bash
+# 파티션별 LAG (컨슈머가 아직 못 읽은 메시지 수)
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group warning-event-writer
+
+# 보낸 이벤트(kma_warning_pub) vs 받은 이벤트(warning_event)
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "select (select count(*) from kma_warning_pub) as 보냄, (select count(*) from warning_event) as 받음"'
+
+# 컨슈머 로그 ("받은 n건: 새 이벤트 x, 중복 y")
+docker compose logs --tail 20 consumer
+```
+
+서울 특보구역(서울동북권 등)은 공식 구 목록을 확인할 때까지 일부러 미매핑으로 둔다 → `미매핑_구역`에 서울만 나오면 정상.
