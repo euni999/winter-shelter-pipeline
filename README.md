@@ -75,4 +75,3 @@ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 docker compose logs --tail 20 consumer
 ```
 
-서울 특보구역(서울동북권 등)은 공식 구 목록을 확인할 때까지 일부러 미매핑으로 둔다 → `미매핑_구역`에 서울만 나오면 정상.
